@@ -3,7 +3,8 @@ library widget_visibility_checker;
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
-import 'package:throttled/throttled.dart';
+import 'package:flutter/rendering.dart';
+import 'package:widget_visibility_checker/debounce.dart';
 
 class WidgetVisibilityChecker extends StatefulWidget {
   const WidgetVisibilityChecker({
@@ -14,9 +15,10 @@ class WidgetVisibilityChecker extends StatefulWidget {
     this.mainAxisEndingEdgeDeflateRatio = 0.0,
     this.crossAxisStartingEdgeDeflateRatio = 0.0,
     this.crossAxisEndingEdgeDeflateRatio = 0.0,
-    this.drawDebugOverlay = true,
-    this.defaultThrottleTime = 100,
+    this.drawDebugOverlay = false,
+    this.defaultThrottleTime = 500,
     this.offScreenColor,
+    this.enableAdvancedScrollDetectionMethod = false,
     required this.handler,
   });
 
@@ -32,6 +34,9 @@ class WidgetVisibilityChecker extends StatefulWidget {
   final Axis childScrollDirection;
   final Color? offScreenColor;
   final bool ignorePointer = true;
+  /// Enable it to detect scroll events initiated by the scrollbar thumb when dragged by the user.
+  /// Enabling This, slightly decrease performance
+  final bool enableAdvancedScrollDetectionMethod;
   final VisibilityChangeHandler handler;
 
   @override
@@ -40,7 +45,7 @@ class WidgetVisibilityChecker extends StatefulWidget {
 
   static WidgetVisibilityCheckerState watch(BuildContext context) {
     final WidgetVisibilityCheckerState? state =
-        context.findAncestorStateOfType<WidgetVisibilityCheckerState>();
+    context.findAncestorStateOfType<WidgetVisibilityCheckerState>();
     if (state == null) {
       throw Exception(
           "Unable to find WidgetVisibilityChecker in the widget tree.");
@@ -55,7 +60,7 @@ class WidgetVisibilityChecker extends StatefulWidget {
       throw Exception("BuildContext is not available.");
     }
     final WidgetVisibilityCheckerState? state =
-        context.findAncestorStateOfType<WidgetVisibilityCheckerState>();
+    context.findAncestorStateOfType<WidgetVisibilityCheckerState>();
     if (state == null) {
       throw Exception(
           "Unable to find WidgetVisibilityChecker in the widget tree.");
@@ -66,11 +71,12 @@ class WidgetVisibilityChecker extends StatefulWidget {
 
   static bool isKeyInspected(VisibilityKey key) {
     var context = key.currentContext;
+
     if (context == null) {
       return false;
     }
     final WidgetVisibilityCheckerState? state =
-        context.findAncestorStateOfType<WidgetVisibilityCheckerState>();
+    context.findAncestorStateOfType<WidgetVisibilityCheckerState>();
     if (state == null) {
       throw Exception(
           "Unable to find WidgetVisibilityChecker in the widget tree.");
@@ -81,7 +87,7 @@ class WidgetVisibilityChecker extends StatefulWidget {
 
   static void unwatch(BuildContext context, bool alsoRemoveKeyFromCollection) {
     final WidgetVisibilityCheckerState? state =
-        context.findAncestorStateOfType<WidgetVisibilityCheckerState>();
+    context.findAncestorStateOfType<WidgetVisibilityCheckerState>();
     if (state == null) {
       throw Exception(
           "Unable to find WidgetVisibilityChecker in the widget tree.");
@@ -89,10 +95,10 @@ class WidgetVisibilityChecker extends StatefulWidget {
     state.removeContext(context, alsoRemoveKeyFromCollection);
   }
 
-  static void unwatchAll(
-      BuildContext context, bool alsoRemoveKeyFromCollection) {
+  static void unwatchAll(BuildContext context,
+      bool alsoRemoveKeyFromCollection) {
     final WidgetVisibilityCheckerState? state =
-        context.findAncestorStateOfType<WidgetVisibilityCheckerState>();
+    context.findAncestorStateOfType<WidgetVisibilityCheckerState>();
     if (state == null) {
       throw Exception(
           "Unable to find WidgetVisibilityChecker in the widget tree.");
@@ -102,387 +108,317 @@ class WidgetVisibilityChecker extends StatefulWidget {
 }
 
 class WidgetVisibilityCheckerState extends State<WidgetVisibilityChecker> {
-  late final throttleId = UniqueKey().hashCode.toString();
-  Map<BuildContext, List<ScrollableState>> scrollablePerSubject = {};
+  final Debounce throttle = Debounce();
+  final Map<BuildContext, List<ScrollableState>> scrollablePerSubject = {};
+  final List<BuildContext> contextList =
+  List<BuildContext>.empty(growable: true);
 
-  bool _onNotification(_) {
-    WidgetsBinding.instance.addPostFrameCallback(
-      (passedDuration) {
-        final BuildContext rootContext = context;
-        if (!rootContext.mounted) return;
+  ScrollDirection currentScrollDirection = ScrollDirection
+      .reverse; //content goes up//scroll goes down//vertical-position increases
+  int previousMetricHash = 0;
+  VisibilityKey? inspectionKey;
+  bool duringComputationPhase = false;
 
-        Map<VisibilityKey, Map<String, dynamic>?> newStates = {};
+  void addContext(BuildContext subjectContext) {
+    if (contextList.contains(subjectContext)) return;
+    if (!(subjectContext.mounted)) return;
 
-        var rootRenderBox = rootContext.findRenderObject() as RenderBox?;
-        if (rootRenderBox == null) {
-          return;
-        }
+    contextList.add(subjectContext);
 
-        void processSubject(BuildContext subjectContext) {
-          if (!subjectContext.mounted) return;
+    //put it in the cache if isn't already
+    scrollablePerSubject.putIfAbsent(subjectContext,
+            () => findAncestorScrollableList(subjectContext, context));
+  }
 
-          RenderBox? subjectRenderBox =
-              subjectContext.findRenderObject() as RenderBox?;
-          if (subjectRenderBox == null || !subjectRenderBox.attached) {
-            return;
-          }
+  void removeContext(BuildContext subjectContext,
+      bool alsoRemoveKeyFromCollection) {
+    if (!contextList.contains(subjectContext)) return;
+    contextList.remove(subjectContext);
 
-          Rect intersectionRect = subjectRenderBox.localToGlobal(Offset.zero,
-                  ancestor: rootRenderBox) &
-              subjectRenderBox.size;
+    widget.handler.clearStateForKey(subjectContext.widget.key as VisibilityKey,
+        alsoRemoveKeyFromCollection);
+    if (scrollablePerSubject.keys.contains(subjectContext)) {
+      scrollablePerSubject.remove(subjectContext);
+    }
+  }
 
-          //put it in the cache if isn't already
-          scrollablePerSubject.putIfAbsent(subjectContext,
-              () => findAncestorScrollableList(subjectContext, rootContext));
-          //pull it from the cache
-          var ancestorScrollableLayerStates =
-              scrollablePerSubject[subjectContext]!;
+  void removeAllContext(bool alsoRemoveKeyFromCollection) {
+    contextList.clear();
+    scrollablePerSubject.clear();
+    widget.handler.clearStateForAllKeys(alsoRemoveKeyFromCollection);
+  }
 
-          Map<String, dynamic>? primaryMapper(
-              ScrollableState currentScrollableState) {
-            // check pre-conditions...
-            var index =
-                ancestorScrollableLayerStates.indexOf(currentScrollableState);
+  void inspect(VisibilityKey key) {
+    inspectionKey = key;
+  }
 
-            var previousScrollableState =
-                index > 0 ? ancestorScrollableLayerStates[index - 1] : null;
+  bool isKeyInspected(VisibilityKey key) {
+    return inspectionKey == key;
+  }
 
-            final RenderBox? currentViewPortRenderBox =
-                currentScrollableState.context.findRenderObject() as RenderBox?;
-            if (currentViewPortRenderBox == null ||
-                !currentViewPortRenderBox.attached) {
-              return null;
-            }
+  bool isAncestorOf(BuildContext potentialAncestorContext,
+      BuildContext childContext) {
+    BuildContext? currentContext = childContext;
 
-            final currentViewPortRect = currentViewPortRenderBox
-                    .localToGlobal(Offset.zero, ancestor: rootRenderBox) &
-                currentViewPortRenderBox.size;
-
-            var visibleAreaLengthInPreviousStage =
-                (previousScrollableState ?? currentScrollableState)
-                            .position
-                            .axis ==
-                        Axis.vertical
-                    ? intersectionRect.height
-                    : intersectionRect.width;
-
-            var noVisibleAreaDetectedInPreviousStage =
-                visibleAreaLengthInPreviousStage <= 0;
-
-            if (noVisibleAreaDetectedInPreviousStage) {
-              return null;
-            }
-
-            var isTopMostScrollableLayer =
-                index == ancestorScrollableLayerStates.length - 1;
-
-            var viewPortMainLengthInThisStage =
-                currentScrollableState.position.axis == Axis.vertical
-                    ? currentViewPortRect.height
-                    : currentViewPortRect.width;
-
-            var viewPortCrossLengthInThisStage =
-                currentScrollableState.position.axis == Axis.horizontal
-                    ? currentViewPortRect.height
-                    : currentViewPortRect.width;
-
-            double mainAxisStartingEdgeDeflateOffset = isTopMostScrollableLayer
-                ? widget.mainAxisStartingEdgeDeflateRatio *
-                    viewPortMainLengthInThisStage
-                : 0.0;
-            double mainAxisEndingEdgeDeflateOffset = isTopMostScrollableLayer
-                ? widget.mainAxisEndingEdgeDeflateRatio *
-                    viewPortMainLengthInThisStage
-                : 0.0;
-
-            double crossAxisStartingEdgeDeflateOffset = isTopMostScrollableLayer
-                ? widget.crossAxisStartingEdgeDeflateRatio *
-                    viewPortCrossLengthInThisStage
-                : 0.0;
-            double crossAxisEndingEdgeDeflateOffset = isTopMostScrollableLayer
-                ? widget.crossAxisEndingEdgeDeflateRatio *
-                    viewPortCrossLengthInThisStage
-                : 0.0;
-
-            // calculations...
-            double subjectTopViewPortBottom =
-                currentViewPortRect.bottomCenter.dy -
-                    intersectionRect.topCenter.dy;
-
-            double subjectTopViewPortTop = intersectionRect.topCenter.dy -
-                currentViewPortRect.topCenter.dy;
-
-            double subjectBottomViewPortTop =
-                intersectionRect.bottomCenter.dy -
-                    currentViewPortRect.topCenter.dy;
-
-            double subjectBottomViewPortBottom =
-                currentViewPortRect.bottomCenter.dy -
-                    intersectionRect.bottomCenter.dy;
-
-            double subjectLeftViewPortRight =
-                currentViewPortRect.centerRight.dx -
-                    intersectionRect.centerLeft.dx;
-
-            double subjectLeftViewPortLeft = intersectionRect.centerLeft.dx -
-                currentViewPortRect.centerLeft.dx;
-
-            double subjectRightViewPortLeft = intersectionRect.centerRight.dx -
-                currentViewPortRect.centerLeft.dx;
-
-            double subjectRightViewPortRight =
-                currentViewPortRect.centerRight.dx -
-                    intersectionRect.centerRight.dx;
-
-            bool isLtr =
-                (Directionality.maybeOf(currentScrollableState.context) ??
-                        TextDirection.ltr) ==
-                    TextDirection.ltr;
-
-            // post calculations...
-            intersectionRect = intersectionRect.intersect(currentViewPortRect);
-
-            if (currentScrollableState.position.axis == Axis.vertical) {
-              return {
-                'flow': 'vertical-flow',
-                'viewPortDeflated': (mainAxisStartingEdgeDeflateOffset +
-                            mainAxisEndingEdgeDeflateOffset) >
-                        0.0 ||
-                    (crossAxisStartingEdgeDeflateOffset +
-                            crossAxisEndingEdgeDeflateOffset) >
-                        0.0,
-                'index': index,
-                // main axis
-                'subjectMainAxisStartViewPortEnd':
-                    subjectTopViewPortBottom - mainAxisEndingEdgeDeflateOffset,
-                'subjectMainAxisStartViewPortStart':
-                    subjectTopViewPortTop - mainAxisStartingEdgeDeflateOffset,
-                'subjectMainAxisEndViewPortStart': subjectBottomViewPortTop -
-                    mainAxisStartingEdgeDeflateOffset,
-                'subjectMainAxisEndViewPortEnd': subjectBottomViewPortBottom -
-                    mainAxisEndingEdgeDeflateOffset,
-                'viewPortMainLength': currentViewPortRenderBox.size.height,
-                'viewPortMainLengthDeflated':
-                    currentViewPortRenderBox.size.height -
-                        mainAxisEndingEdgeDeflateOffset -
-                        mainAxisStartingEdgeDeflateOffset,
-                // cross axis
-                'subjectCrossAxisStartViewPortEnd': (isLtr
-                        ? subjectLeftViewPortRight
-                        : subjectRightViewPortLeft) -
-                    crossAxisEndingEdgeDeflateOffset,
-                'subjectCrossAxisStartViewPortStart': (isLtr
-                        ? subjectLeftViewPortLeft
-                        : subjectRightViewPortRight) -
-                    crossAxisStartingEdgeDeflateOffset,
-                'subjectCrossAxisEndViewPortStart': (isLtr
-                        ? subjectRightViewPortLeft
-                        : subjectLeftViewPortRight) -
-                    crossAxisStartingEdgeDeflateOffset,
-                'subjectCrossAxisEndViewPortEnd': (isLtr
-                        ? subjectRightViewPortRight
-                        : subjectLeftViewPortLeft) -
-                    crossAxisEndingEdgeDeflateOffset,
-                'viewPortCrossLength': currentViewPortRenderBox.size.width,
-                'viewPortCrossLengthDeflated':
-                    currentViewPortRenderBox.size.width -
-                        crossAxisEndingEdgeDeflateOffset -
-                        crossAxisStartingEdgeDeflateOffset,
-              };
-            } else {
-              return {
-                'flow': 'horizontal-flow',
-                'viewPortDeflated': (mainAxisStartingEdgeDeflateOffset +
-                            mainAxisEndingEdgeDeflateOffset) >
-                        0.0 ||
-                    (crossAxisStartingEdgeDeflateOffset +
-                            crossAxisEndingEdgeDeflateOffset) >
-                        0.0,
-                'index': index,
-                // main axis
-                'subjectMainAxisStartViewPortEnd': (isLtr
-                        ? subjectLeftViewPortRight
-                        : subjectRightViewPortLeft) -
-                    mainAxisEndingEdgeDeflateOffset,
-                'subjectMainAxisStartViewPortStart': (isLtr
-                        ? subjectLeftViewPortLeft
-                        : subjectRightViewPortRight) -
-                    mainAxisStartingEdgeDeflateOffset,
-                'subjectMainAxisEndViewPortStart': (isLtr
-                        ? subjectRightViewPortLeft
-                        : subjectLeftViewPortRight) -
-                    mainAxisStartingEdgeDeflateOffset,
-                'subjectMainAxisEndViewPortEnd': (isLtr
-                        ? subjectRightViewPortRight
-                        : subjectLeftViewPortLeft) -
-                    mainAxisEndingEdgeDeflateOffset,
-                'viewPortMainLength': currentViewPortRenderBox.size.width,
-                'viewPortMainLengthDeflated':
-                    currentViewPortRenderBox.size.width -
-                        mainAxisEndingEdgeDeflateOffset -
-                        mainAxisStartingEdgeDeflateOffset,
-                // cross axis
-                'subjectCrossAxisStartViewPortEnd': subjectTopViewPortBottom -
-                    crossAxisEndingEdgeDeflateOffset,
-                'subjectCrossAxisStartViewPortStart':
-                    subjectTopViewPortTop - crossAxisStartingEdgeDeflateOffset,
-                'subjectCrossAxisEndViewPortStart': subjectBottomViewPortTop -
-                    crossAxisStartingEdgeDeflateOffset,
-                'subjectCrossAxisEndViewPortEnd': subjectBottomViewPortBottom -
-                    crossAxisEndingEdgeDeflateOffset,
-                'viewPortCrossLength': currentViewPortRenderBox.size.height,
-                'viewPortCrossLengthDeflated':
-                    currentViewPortRenderBox.size.height -
-                        crossAxisEndingEdgeDeflateOffset -
-                        crossAxisStartingEdgeDeflateOffset,
-              };
-            }
-          }
-
-          Map<String, dynamic> secondaryMapper(Map<String, dynamic>? it) {
-            // extra computation ..
-            int index = it!['index']!;
-            //main
-            String mainPosition = '';
-            double subjectMainAxisStartViewPortEnd =
-                it['subjectMainAxisStartViewPortEnd']!;
-            double subjectMainAxisStartViewPortStart =
-                it['subjectMainAxisStartViewPortStart']!;
-            double subjectMainAxisEndViewPortStart =
-                it['subjectMainAxisEndViewPortStart']!;
-            double subjectMainAxisEndViewPortEnd =
-                it['subjectMainAxisEndViewPortEnd']!;
-            double viewPortMainLength = it['viewPortMainLength']!;
-
-            if (subjectMainAxisStartViewPortStart >= 0 &&
-                subjectMainAxisEndViewPortEnd >= 0) {
-              mainPosition = 'within-vp';
-            } else if (subjectMainAxisStartViewPortStart < 0 &&
-                subjectMainAxisEndViewPortEnd < 0) {
-              mainPosition = 'across-vp';
-            } else if (subjectMainAxisStartViewPortStart >= 0 &&
-                subjectMainAxisEndViewPortEnd < 0) {
-              mainPosition = subjectMainAxisStartViewPortEnd > 0
-                  ? 'touched-vp-end'
-                  : 'outside-vp-end';
-            } else if (subjectMainAxisStartViewPortStart < 0 &&
-                subjectMainAxisEndViewPortEnd >= 0) {
-              mainPosition = subjectMainAxisEndViewPortStart > 0
-                  ? 'touched-vp-start'
-                  : 'outside-vp-start';
-            } else {
-              throw Exception("Invalid mainPosition State.");
-            }
-
-            //cross
-            String crossPosition = '';
-            double subjectCrossAxisStartViewPortEnd =
-                it['subjectCrossAxisStartViewPortEnd']!;
-            double subjectCrossAxisStartViewPortStart =
-                it['subjectCrossAxisStartViewPortStart']!;
-            double subjectCrossAxisEndViewPortStart =
-                it['subjectCrossAxisEndViewPortStart']!;
-            double subjectCrossAxisEndViewPortEnd =
-                it['subjectCrossAxisEndViewPortEnd']!;
-            double viewPortCrossLength = it['viewPortCrossLength']!;
-            if (subjectCrossAxisStartViewPortStart >= 0 &&
-                subjectCrossAxisEndViewPortEnd >= 0) {
-              crossPosition = 'within-vp';
-            } else if (subjectCrossAxisStartViewPortStart < 0 &&
-                subjectCrossAxisEndViewPortEnd < 0) {
-              crossPosition = 'across-vp';
-            } else if (subjectCrossAxisStartViewPortStart >= 0 &&
-                subjectCrossAxisEndViewPortEnd < 0) {
-              crossPosition = subjectCrossAxisStartViewPortEnd > 0
-                  ? 'touched-vp-end'
-                  : 'outside-vp-end';
-            } else if (subjectCrossAxisStartViewPortStart < 0 &&
-                subjectCrossAxisEndViewPortEnd >= 0) {
-              crossPosition = subjectCrossAxisEndViewPortStart > 0
-                  ? 'touched-vp-start'
-                  : 'outside-vp-start';
-            } else {
-              throw Exception("Invalid crossPosition State.");
-            }
-
-            bool viewPortDeflated = it['viewPortDeflated']! as bool;
-            String flow = it['flow'];
-
-            return {
-              'index': index,
-              'flow': flow,
-              'offScreen': mainPosition.contains('outside') ||
-                  crossPosition.contains('outside'),
-              'topMostLayer': index == ancestorScrollableLayerStates.length - 1,
-              'viewPortDeflated': viewPortDeflated,
-
-              // main
-              'mainPosition': mainPosition,
-              'subjectMainAxisStartViewPortEnd':
-                  subjectMainAxisStartViewPortEnd,
-              'subjectMainAxisStartViewPortStart':
-                  subjectMainAxisStartViewPortStart,
-              'subjectMainAxisEndViewPortStart':
-                  subjectMainAxisEndViewPortStart,
-              'subjectMainAxisEndViewPortEnd': subjectMainAxisEndViewPortEnd,
-              'viewPortMainLength': viewPortMainLength,
-
-              //cross
-              'crossPosition': crossPosition,
-              'subjectCrossAxisStartViewPortEnd':
-                  subjectCrossAxisStartViewPortEnd,
-              'subjectCrossAxisStartViewPortStart':
-                  subjectCrossAxisStartViewPortStart,
-              'subjectCrossAxisEndViewPortStart':
-                  subjectCrossAxisEndViewPortStart,
-              'subjectCrossAxisEndViewPortEnd': subjectCrossAxisEndViewPortEnd,
-              'viewPortCrossLength': viewPortCrossLength,
-            };
-          }
-
-          List<Map<String, dynamic>> visibilityStateLayers =
-              ancestorScrollableLayerStates
-                  .map(primaryMapper)
-                  .where((it) => it != null)
-                  .map(secondaryMapper)
-                  .toList();
-
-          if (visibilityStateLayers.isEmpty) return;
-
-          newStates[subjectContext.widget.key as VisibilityKey] = {
-            'depth': ancestorScrollableLayerStates.length,
-            'head': visibilityStateLayers.isNotEmpty &&
-                    visibilityStateLayers.length ==
-                        ancestorScrollableLayerStates.length
-                ? visibilityStateLayers.last
-                : null,
-            'layers': visibilityStateLayers,
-            'summary': visibilityStateLayers
-                .map((it) =>
-                    '${it['mainPosition'] as String}/${it['crossPosition'] as String}:${it['flow'] as String}')
-                .join("|")
-          };
-        }
-
-        contextList.where((it) => it.mounted).forEach(processSubject);
-
-        // emit the states ...
-        //
-
-        bool metricsChanged = widget.handler.didChangeVisibility(newStates);
-
-        if (metricsChanged && widget.drawDebugOverlay) {
-          setState(() {}); // repaint debug overlay
-        }
-      },
-    );
+    while (currentContext != null) {
+      if (currentContext == potentialAncestorContext) {
+        return true;
+      }
+      // Move up the widget tree
+      currentContext = currentContext
+          .findAncestorStateOfType<WidgetVisibilityCheckerState>()
+          ?.context;
+    }
+    // potentialAncestorContext is not found in the ancestor chain
     return false;
   }
 
-  void _triggerDelayedNotification(_) {
-    throttle(throttleId, () => _onNotification(_),
-        cooldown: Duration(milliseconds: widget.defaultThrottleTime),
-        leaky: true);
+  List<ScrollableState> findAncestorScrollableList(BuildContext? subjectContext,
+      BuildContext rootContext) {
+    List<ScrollableState> scrollableList = [];
+
+    void process(BuildContext? currentContext) {
+      if (currentContext == null) return;
+
+      final scrollableState =
+      currentContext.findAncestorStateOfType<ScrollableState>();
+
+      if (scrollableState == null) return;
+
+      if (!isAncestorOf(
+          rootContext /* rootContext is not ancestor of scrollableState context.
+      it means that scrollableState level is way higher than it's limit (rootContext level)*/
+          ,
+          scrollableState.context)) return;
+
+      scrollableList.add(scrollableState);
+
+      process(scrollableState.context);
+    }
+
+    process(subjectContext);
+
+    return scrollableList;
+  }
+
+  Future<void> _triggerDelayedNotification(_) async {
+    if (duringComputationPhase) {
+      return;
+    }
+    duringComputationPhase = true;
+
+    Future breakIntoNextEventLoop() async {
+      return Future.delayed(const Duration(milliseconds: 5));
+    }
+
+    Future<void> process() async {
+      try {
+        await breakIntoNextEventLoop();
+
+        var rootRenderBox = () {
+          if (!context.mounted) {
+            return null;
+          }
+          return context.findRenderObject() as RenderBox?;
+        }();
+
+        /// Check precondition
+        if (rootRenderBox == null || !rootRenderBox.attached) {
+          return;
+        }
+        final Map<VisibilityKey, List<Map<String, dynamic>>>
+        scrollableListPerSubjectId = {};
+
+
+        for (var subjectContext in contextList) {
+          await breakIntoNextEventLoop();
+
+          RenderBox? subjectRenderBox = () {
+            if (!subjectContext.mounted) {
+              return null;
+            }
+            return subjectContext.findRenderObject() as RenderBox?;
+          }();
+
+          /// Check precondition
+          if (!subjectContext.mounted) {
+            continue;
+          }
+          if (subjectRenderBox == null ||
+              !subjectRenderBox.attached) {
+            continue;
+          }
+
+          scrollableListPerSubjectId[subjectContext.widget.key
+          as VisibilityKey] = List.empty(growable: true);
+
+          Rect intersectionRect = () {
+            return subjectRenderBox.localToGlobal(Offset.zero,
+                ancestor: rootRenderBox) &
+            subjectRenderBox.size;
+          }();
+
+          for (var currentScrollableState
+          in scrollablePerSubject[subjectContext]!) {
+            var index = scrollablePerSubject[subjectContext]!
+                .indexOf(currentScrollableState);
+
+            var previousScrollableState = index > 0
+                ? scrollablePerSubject[subjectContext]![index - 1]
+                : null;
+
+            final RenderBox? currentViewPortRenderBox = () {
+              if (!currentScrollableState.context.mounted) {
+                return null;
+              }
+              return currentScrollableState.context.findRenderObject()
+              as RenderBox?;
+            }();
+
+            /// Precondition
+            if (!subjectContext.mounted) {
+              continue;
+            }
+            if (currentViewPortRenderBox ==
+                null ||
+                !currentViewPortRenderBox.attached
+            ) {
+              continue;
+            }
+
+            final currentViewPortRect = () {
+              return currentViewPortRenderBox.localToGlobal(
+                  Offset.zero,
+                  ancestor: rootRenderBox) &
+              currentViewPortRenderBox.size;
+            }();
+
+            var visibleAreaLengthInPreviousStage = () {
+              return (previousScrollableState ??
+                  currentScrollableState)
+                  .position
+                  .axis ==
+                  Axis.vertical
+                  ? intersectionRect.height
+                  : intersectionRect.width;
+            }();
+
+            var viewPortMainLengthInThisStage = () {
+              return currentScrollableState.position.axis ==
+                  Axis.vertical
+                  ? currentViewPortRect.height
+                  : currentViewPortRect.width;
+            }();
+
+            var viewPortCrossLengthInThisStage = () {
+              return currentScrollableState.position.axis ==
+                  Axis.horizontal
+                  ? currentViewPortRect.height
+                  : currentViewPortRect.width;
+            }();
+
+            bool isLtr = () {
+              return (Directionality.maybeOf(
+                  currentScrollableState.context) ??
+                  TextDirection.ltr) ==
+                  TextDirection.ltr;
+            }();
+
+            scrollableListPerSubjectId[
+            subjectContext.widget.key as VisibilityKey]!
+                .add({
+              "index": index,
+              'visibleAreaLengthInPreviousStage':
+              visibleAreaLengthInPreviousStage,
+              "viewPortMainLengthInThisStage": viewPortMainLengthInThisStage,
+              "viewPortCrossLengthInThisStage":
+              viewPortCrossLengthInThisStage,
+              "viewPort.topCenter.dy": currentViewPortRect.topCenter
+                  .dy,
+              "viewPort.bottomCenter.dy": currentViewPortRect
+                  .bottomCenter
+                  .dy,
+              "viewPort.centerLeft.dx": currentViewPortRect.centerLeft
+                  .dx,
+              "viewPort.centerRight.dx": currentViewPortRect
+                  .centerRight
+                  .dx,
+              'intersection.topCenter.dy': intersectionRect.topCenter
+                  .dy,
+              'intersection.bottomCenter.dy':
+              intersectionRect.bottomCenter.dy,
+              'intersection.centerLeft.dx': intersectionRect
+                  .centerLeft
+                  .dx,
+              'intersection.centerRight.dx': intersectionRect
+                  .centerRight
+                  .dx,
+              "isLtr": isLtr,
+              "position.axis":
+              currentScrollableState.position.axis == Axis.vertical
+                  ? "Axis.vertical"
+                  : "Axis.horizontal",
+              "size.height": currentViewPortRect.size.height,
+              "size.width": currentViewPortRect.size.width,
+            });
+
+            /// post calculation
+            intersectionRect =
+                intersectionRect.intersect(currentViewPortRect);
+          }
+        }
+
+
+        var newStates = computeMetricsAndVisibilityStates(
+            scrollableListPerSubjectId,
+            widget.mainAxisStartingEdgeDeflateRatio,
+            widget.mainAxisEndingEdgeDeflateRatio,
+            widget.crossAxisStartingEdgeDeflateRatio,
+            widget.crossAxisEndingEdgeDeflateRatio);
+
+        int currentMetricHash = newStates.keys
+            .map((key) {
+          if (newStates[key]?["head"] == null) return '_';
+          var head = (newStates[key]?["head"]) as Map<String,
+              dynamic>?;
+          return json.encode(head);
+        })
+            .join('#')
+            .hashCode;
+
+        await breakIntoNextEventLoop();
+
+        if (currentMetricHash != previousMetricHash) {
+          previousMetricHash = currentMetricHash;
+
+          widget.handler.applyAndNotify(
+              newStates, currentScrollDirection);
+          if (widget.drawDebugOverlay) {
+            if (mounted) {
+              setState(() {}); // repaint debug overlay
+            }
+          }
+        }
+      } catch (e, s) {
+        debugPrint("an error occurred during computation phase!");
+        debugPrint('Exception details:\n $e');
+        debugPrint('Stack trace:\n $s');
+      }
+    }
+
+    throttle.throttle(
+      Duration(milliseconds: widget.defaultThrottleTime),
+          () async {
+        await process();
+        duringComputationPhase = false;
+      },
+      type: BehaviorType.leadingAndTrailing,
+    );
+  }
+
+  @override
+  void initState() {
+    super.initState();
   }
 
   @override
@@ -491,13 +427,13 @@ class WidgetVisibilityCheckerState extends State<WidgetVisibilityChecker> {
   }
 
   @override
-  Widget build(BuildContext context/*root context*/) {
+  Widget build(BuildContext context /*root context*/) {
     var shouldDisplayClippedArea = widget.drawDebugOverlay &&
         ((widget.mainAxisStartingEdgeDeflateRatio +
-                    widget.mainAxisEndingEdgeDeflateRatio) >
-                0.0 ||
+            widget.mainAxisEndingEdgeDeflateRatio) >
+            0.0 ||
             (widget.crossAxisStartingEdgeDeflateRatio +
-                    widget.crossAxisEndingEdgeDeflateRatio) >
+                widget.crossAxisEndingEdgeDeflateRatio) >
                 0.0);
 
     contextList.removeWhere((it) => !it.mounted);
@@ -507,7 +443,7 @@ class WidgetVisibilityCheckerState extends State<WidgetVisibilityChecker> {
     if (inspectionKey != null) {
       validStateCollection = validStateCollection
           .where((it) =>
-              it == widget.handler.visibilityStateByKey(inspectionKey!.id))
+      it == widget.handler.visibilityStateByKey(inspectionKey!.id))
           .toList();
     } else {
       validStateCollection = [];
@@ -536,18 +472,18 @@ class WidgetVisibilityCheckerState extends State<WidgetVisibilityChecker> {
       viewPortMainLength = head['viewPortMainLength'];
       subjectMainAxisStartViewPortEnd = head['subjectMainAxisStartViewPortEnd'];
       subjectMainAxisStartViewPortStart =
-          head['subjectMainAxisStartViewPortStart'];
+      head['subjectMainAxisStartViewPortStart'];
       subjectMainAxisEndViewPortStart = head['subjectMainAxisEndViewPortStart'];
       subjectMainAxisEndViewPortEnd = head['subjectMainAxisEndViewPortEnd'];
 
       //cross
       viewPortCrossLength = head['viewPortCrossLength'];
       subjectCrossAxisStartViewPortEnd =
-          head['subjectCrossAxisStartViewPortEnd'];
+      head['subjectCrossAxisStartViewPortEnd'];
       subjectCrossAxisStartViewPortStart =
-          head['subjectCrossAxisStartViewPortStart'];
+      head['subjectCrossAxisStartViewPortStart'];
       subjectCrossAxisEndViewPortStart =
-          head['subjectCrossAxisEndViewPortStart'];
+      head['subjectCrossAxisEndViewPortStart'];
       subjectCrossAxisEndViewPortEnd = head['subjectCrossAxisEndViewPortEnd'];
     }
 
@@ -559,17 +495,36 @@ class WidgetVisibilityCheckerState extends State<WidgetVisibilityChecker> {
       child: Stack(fit: StackFit.expand, children: [
         NotificationListener<SizeChangedLayoutNotification>(
           child: NotificationListener<ScrollNotification>(
-            child: widget.child,
             onNotification: (data) {
-              // scroll change notification
-              _triggerDelayedNotification(data);
-              return false;
+              if (widget.enableAdvancedScrollDetectionMethod) {
+                _triggerDelayedNotification(data);
+              }
+              return true;
             },
+            child: NotificationListener<UserScrollNotification>(
+              child: widget.child,
+              onNotification: (data) { // UserScroll
+                // scroll change notification
+                currentScrollDirection = () {
+                  if (data.direction != ScrollDirection.idle) {
+                    return data.direction;
+                  } else {
+                    return currentScrollDirection;
+                  }
+                }();
+
+                if (data.direction == ScrollDirection.idle) {
+                  _triggerDelayedNotification(data);
+                }
+
+                return true;
+              },
+            ),
           ),
-          onNotification: (data) {
+          onNotification: (data) { // Size
             //any descendant size changed
             _triggerDelayedNotification(data);
-            return false;
+            return true;
           },
         ),
         if (shouldDisplayMetricBars &&
@@ -581,26 +536,26 @@ class WidgetVisibilityCheckerState extends State<WidgetVisibilityChecker> {
             rotate: false,
             subjectVerticalAxisEndViewPortEnd: subjectMainAxisEndViewPortEnd,
             subjectVerticalAxisEndViewPortStart:
-                subjectMainAxisEndViewPortStart,
+            subjectMainAxisEndViewPortStart,
             subjectVerticalAxisStartViewPortEnd:
-                subjectMainAxisStartViewPortEnd,
+            subjectMainAxisStartViewPortEnd,
             subjectVerticalAxisStartViewPortStart:
-                subjectMainAxisStartViewPortStart,
+            subjectMainAxisStartViewPortStart,
             verticalStartPadding:
-                widget.mainAxisStartingEdgeDeflateRatio * viewPortMainLength,
+            widget.mainAxisStartingEdgeDeflateRatio * viewPortMainLength,
             verticalEndPadding:
-                widget.mainAxisEndingEdgeDeflateRatio * viewPortMainLength,
+            widget.mainAxisEndingEdgeDeflateRatio * viewPortMainLength,
             subjectHorizontalAxisEndViewPortEnd: subjectCrossAxisEndViewPortEnd,
             subjectHorizontalAxisEndViewPortStart:
-                subjectCrossAxisEndViewPortStart,
+            subjectCrossAxisEndViewPortStart,
             subjectHorizontalAxisStartViewPortEnd:
-                subjectCrossAxisStartViewPortEnd,
+            subjectCrossAxisStartViewPortEnd,
             subjectHorizontalAxisStartViewPortStart:
-                subjectCrossAxisStartViewPortStart,
+            subjectCrossAxisStartViewPortStart,
             horizontalStartPadding:
-                widget.crossAxisStartingEdgeDeflateRatio * viewPortCrossLength,
+            widget.crossAxisStartingEdgeDeflateRatio * viewPortCrossLength,
             horizontalEndPadding:
-                widget.crossAxisEndingEdgeDeflateRatio * viewPortCrossLength,
+            widget.crossAxisEndingEdgeDeflateRatio * viewPortCrossLength,
           ),
         if (shouldDisplayMetricBars &&
             widget.childScrollDirection == Axis.horizontal)
@@ -611,26 +566,26 @@ class WidgetVisibilityCheckerState extends State<WidgetVisibilityChecker> {
             rotate: true,
             subjectHorizontalAxisEndViewPortEnd: subjectMainAxisEndViewPortEnd,
             subjectHorizontalAxisEndViewPortStart:
-                subjectMainAxisEndViewPortStart,
+            subjectMainAxisEndViewPortStart,
             subjectHorizontalAxisStartViewPortEnd:
-                subjectMainAxisStartViewPortEnd,
+            subjectMainAxisStartViewPortEnd,
             subjectHorizontalAxisStartViewPortStart:
-                subjectMainAxisStartViewPortStart,
+            subjectMainAxisStartViewPortStart,
             horizontalStartPadding:
-                widget.mainAxisStartingEdgeDeflateRatio * viewPortMainLength,
+            widget.mainAxisStartingEdgeDeflateRatio * viewPortMainLength,
             horizontalEndPadding:
-                widget.mainAxisEndingEdgeDeflateRatio * viewPortMainLength,
+            widget.mainAxisEndingEdgeDeflateRatio * viewPortMainLength,
             subjectVerticalAxisEndViewPortEnd: subjectCrossAxisEndViewPortEnd,
             subjectVerticalAxisEndViewPortStart:
-                subjectCrossAxisEndViewPortStart,
+            subjectCrossAxisEndViewPortStart,
             subjectVerticalAxisStartViewPortEnd:
-                subjectCrossAxisStartViewPortEnd,
+            subjectCrossAxisStartViewPortEnd,
             subjectVerticalAxisStartViewPortStart:
-                subjectCrossAxisStartViewPortStart,
+            subjectCrossAxisStartViewPortStart,
             verticalStartPadding:
-                widget.crossAxisStartingEdgeDeflateRatio * viewPortCrossLength,
+            widget.crossAxisStartingEdgeDeflateRatio * viewPortCrossLength,
             verticalEndPadding:
-                widget.crossAxisEndingEdgeDeflateRatio * viewPortCrossLength,
+            widget.crossAxisEndingEdgeDeflateRatio * viewPortCrossLength,
           ),
         Visibility(
           visible: shouldDisplayClippedArea,
@@ -641,7 +596,7 @@ class WidgetVisibilityCheckerState extends State<WidgetVisibilityChecker> {
                 endingRatio: widget.mainAxisEndingEdgeDeflateRatio,
                 axis: widget.childScrollDirection,
                 offScreenColor:
-                    widget.offScreenColor ?? Colors.black.withOpacity(0.2),
+                widget.offScreenColor ?? Colors.black.withOpacity(0.5),
               )),
         ),
         Visibility(
@@ -655,89 +610,11 @@ class WidgetVisibilityCheckerState extends State<WidgetVisibilityChecker> {
                     ? Axis.horizontal
                     : Axis.vertical,
                 offScreenColor:
-                    widget.offScreenColor ?? Colors.black.withOpacity(0.2),
+                widget.offScreenColor ?? Colors.black.withOpacity(0.5),
               )),
         ),
       ]),
     );
-  }
-
-  List<BuildContext> contextList = List<BuildContext>.empty(growable: true);
-  VisibilityKey? inspectionKey;
-
-  void addContext(BuildContext ctx) {
-    if (contextList.contains(ctx)) return;
-    contextList.add(ctx);
-  }
-
-  void removeContext(BuildContext ctx, bool alsoRemoveKeyFromCollection) {
-    if (!contextList.contains(ctx)) return;
-    contextList.remove(ctx);
-
-    widget.handler.clearStateForKey(
-        ctx.widget.key as VisibilityKey, alsoRemoveKeyFromCollection);
-  }
-
-  void removeAllContext(bool alsoRemoveKeyFromCollection) {
-    contextList.clear();
-    widget.handler.clearStateForAllKeys(alsoRemoveKeyFromCollection);
-  }
-
-  void inspect(VisibilityKey key) {
-    inspectionKey = key;
-  }
-
-  bool isKeyInspected(VisibilityKey key) {
-    return inspectionKey == key;
-  }
-
-  bool isAncestorOf(
-      BuildContext potentialAncestorContext, BuildContext childContext) {
-    BuildContext? currentContext = childContext;
-
-    while (currentContext != null) {
-      if (currentContext == potentialAncestorContext) {
-        return true;
-      }
-      // Move up the widget tree
-      currentContext = currentContext
-          .findAncestorStateOfType<WidgetVisibilityCheckerState>()
-          ?.context;
-    }
-    // potentialAncestorContext is not found in the ancestor chain
-    return false;
-  }
-
-  List<ScrollableState> findAncestorScrollableList(
-      BuildContext? subjectContext, BuildContext rootContext) {
-    List<ScrollableState> scrollableList = [];
-
-    void process(BuildContext? currentContext) {
-      if (currentContext == null) return;
-
-      final scrollableState =
-          currentContext.findAncestorStateOfType<ScrollableState>();
-
-      if (scrollableState == null) return;
-
-      if (!isAncestorOf(
-          rootContext /* rootContext is not ancestor of scrollableState context.
-      it means that scrollableState level is way higher than it's limit (rootContext level)*/
-          ,
-          scrollableState.context)) return;
-
-      scrollableList.add(scrollableState);
-
-      process(scrollableState.context);
-    }
-
-    process(subjectContext);
-
-    return scrollableList;
-  }
-
-  void invalidateScrollableCache() {
-    scrollablePerSubject = {};
   }
 
   @override
@@ -745,6 +622,306 @@ class WidgetVisibilityCheckerState extends State<WidgetVisibilityChecker> {
     super.didUpdateWidget(oldWidget);
     _triggerDelayedNotification({});
   }
+}
+
+/// Computes new metrics and visibility states for each subject
+Map<VisibilityKey, Map<String, dynamic>?> computeMetricsAndVisibilityStates(
+    Map<VisibilityKey, List<Map<String, dynamic>>> scrollableListPerSubjectId,
+    double mainAxisStartingEdgeDeflateRatio,
+    double mainAxisEndingEdgeDeflateRatio,
+    double crossAxisStartingEdgeDeflateRatio,
+    double crossAxisEndingEdgeDeflateRatio,) {
+  Map<VisibilityKey, Map<String, dynamic>?> newStates = {};
+
+  void processSubject(VisibilityKey subjectKey) {
+    List<Map<String, dynamic>> ancestorScrollableLayerStates =
+    scrollableListPerSubjectId[subjectKey]!;
+
+    Map<String, dynamic>? primaryMapper(
+        Map<String, dynamic> currentScrollableState) {
+      var index = currentScrollableState['index'];
+
+      double visibleAreaLengthInPreviousStage =
+      currentScrollableState["visibleAreaLengthInPreviousStage"];
+
+      var noVisibleAreaDetectedInPreviousStage =
+          visibleAreaLengthInPreviousStage <= 0;
+
+      if (noVisibleAreaDetectedInPreviousStage) {
+        return null;
+      }
+
+      var isTopMostScrollableLayer =
+          index == ancestorScrollableLayerStates.length - 1;
+
+      double viewPortMainLengthInThisStage =
+      currentScrollableState["viewPortMainLengthInThisStage"];
+
+      double viewPortCrossLengthInThisStage =
+      currentScrollableState["viewPortCrossLengthInThisStage"];
+
+      double mainAxisStartingEdgeDeflateOffset = isTopMostScrollableLayer
+          ? mainAxisStartingEdgeDeflateRatio * viewPortMainLengthInThisStage
+          : 0.0;
+      double mainAxisEndingEdgeDeflateOffset = isTopMostScrollableLayer
+          ? mainAxisEndingEdgeDeflateRatio * viewPortMainLengthInThisStage
+          : 0.0;
+
+      double crossAxisStartingEdgeDeflateOffset = isTopMostScrollableLayer
+          ? crossAxisStartingEdgeDeflateRatio * viewPortCrossLengthInThisStage
+          : 0.0;
+      double crossAxisEndingEdgeDeflateOffset = isTopMostScrollableLayer
+          ? crossAxisEndingEdgeDeflateRatio * viewPortCrossLengthInThisStage
+          : 0.0;
+
+      /// calculations...
+      double subjectTopViewPortBottom =
+          currentScrollableState["viewPort.bottomCenter.dy"] -
+              currentScrollableState["intersection.topCenter.dy"];
+
+      double subjectTopViewPortTop =
+          currentScrollableState["intersection.topCenter.dy"] -
+              currentScrollableState["viewPort.topCenter.dy"];
+
+      double subjectBottomViewPortTop =
+          currentScrollableState["intersection.bottomCenter.dy"] -
+              currentScrollableState["viewPort.topCenter.dy"];
+
+      double subjectBottomViewPortBottom =
+          currentScrollableState["viewPort.bottomCenter.dy"] -
+              currentScrollableState["intersection.bottomCenter.dy"];
+
+      double subjectLeftViewPortRight =
+          currentScrollableState["viewPort.centerRight.dx"] -
+              currentScrollableState["intersection.centerLeft.dx"];
+
+      double subjectLeftViewPortLeft =
+          currentScrollableState["intersection.centerLeft.dx"] -
+              currentScrollableState["viewPort.centerLeft.dx"];
+
+      double subjectRightViewPortLeft =
+          currentScrollableState["intersection.centerRight.dx"] -
+              currentScrollableState["viewPort.centerLeft.dx"];
+
+      double subjectRightViewPortRight =
+          currentScrollableState["viewPort.centerRight.dx"] -
+              currentScrollableState["intersection.centerRight.dx"];
+
+      bool isLtr = currentScrollableState["isLtr"];
+
+      if (currentScrollableState["position.axis"] == "Axis.vertical") {
+        return {
+          'flow': 'vertical-flow',
+          'viewPortDeflated': (mainAxisStartingEdgeDeflateOffset +
+              mainAxisEndingEdgeDeflateOffset) >
+              0.0 ||
+              (crossAxisStartingEdgeDeflateOffset +
+                  crossAxisEndingEdgeDeflateOffset) >
+                  0.0,
+          'index': index,
+
+          /// main axis
+          'subjectMainAxisStartViewPortEnd':
+          subjectTopViewPortBottom - mainAxisEndingEdgeDeflateOffset,
+          'subjectMainAxisStartViewPortStart':
+          subjectTopViewPortTop - mainAxisStartingEdgeDeflateOffset,
+          'subjectMainAxisEndViewPortStart':
+          subjectBottomViewPortTop - mainAxisStartingEdgeDeflateOffset,
+          'subjectMainAxisEndViewPortEnd':
+          subjectBottomViewPortBottom - mainAxisEndingEdgeDeflateOffset,
+          'viewPortMainLength': currentScrollableState["size.height"],
+          'viewPortMainLengthDeflated': currentScrollableState["size.height"] -
+              mainAxisEndingEdgeDeflateOffset -
+              mainAxisStartingEdgeDeflateOffset,
+
+          /// cross axis
+          'subjectCrossAxisStartViewPortEnd':
+          (isLtr ? subjectLeftViewPortRight : subjectRightViewPortLeft) -
+              crossAxisEndingEdgeDeflateOffset,
+          'subjectCrossAxisStartViewPortStart':
+          (isLtr ? subjectLeftViewPortLeft : subjectRightViewPortRight) -
+              crossAxisStartingEdgeDeflateOffset,
+          'subjectCrossAxisEndViewPortStart':
+          (isLtr ? subjectRightViewPortLeft : subjectLeftViewPortRight) -
+              crossAxisStartingEdgeDeflateOffset,
+          'subjectCrossAxisEndViewPortEnd':
+          (isLtr ? subjectRightViewPortRight : subjectLeftViewPortLeft) -
+              crossAxisEndingEdgeDeflateOffset,
+          'viewPortCrossLength': currentScrollableState["size.width"],
+          'viewPortCrossLengthDeflated': currentScrollableState["size.width"] -
+              crossAxisEndingEdgeDeflateOffset -
+              crossAxisStartingEdgeDeflateOffset,
+        };
+      } else {
+        return {
+          'flow': 'horizontal-flow',
+          'viewPortDeflated': (mainAxisStartingEdgeDeflateOffset +
+              mainAxisEndingEdgeDeflateOffset) >
+              0.0 ||
+              (crossAxisStartingEdgeDeflateOffset +
+                  crossAxisEndingEdgeDeflateOffset) >
+                  0.0,
+          'index': index,
+
+          /// main axis
+          'subjectMainAxisStartViewPortEnd':
+          (isLtr ? subjectLeftViewPortRight : subjectRightViewPortLeft) -
+              mainAxisEndingEdgeDeflateOffset,
+          'subjectMainAxisStartViewPortStart':
+          (isLtr ? subjectLeftViewPortLeft : subjectRightViewPortRight) -
+              mainAxisStartingEdgeDeflateOffset,
+          'subjectMainAxisEndViewPortStart':
+          (isLtr ? subjectRightViewPortLeft : subjectLeftViewPortRight) -
+              mainAxisStartingEdgeDeflateOffset,
+          'subjectMainAxisEndViewPortEnd':
+          (isLtr ? subjectRightViewPortRight : subjectLeftViewPortLeft) -
+              mainAxisEndingEdgeDeflateOffset,
+          'viewPortMainLength': currentScrollableState["size.width"],
+          'viewPortMainLengthDeflated': currentScrollableState["size.width"] -
+              mainAxisEndingEdgeDeflateOffset -
+              mainAxisStartingEdgeDeflateOffset,
+
+          /// cross axis
+          'subjectCrossAxisStartViewPortEnd':
+          subjectTopViewPortBottom - crossAxisEndingEdgeDeflateOffset,
+          'subjectCrossAxisStartViewPortStart':
+          subjectTopViewPortTop - crossAxisStartingEdgeDeflateOffset,
+          'subjectCrossAxisEndViewPortStart':
+          subjectBottomViewPortTop - crossAxisStartingEdgeDeflateOffset,
+          'subjectCrossAxisEndViewPortEnd':
+          subjectBottomViewPortBottom - crossAxisEndingEdgeDeflateOffset,
+          'viewPortCrossLength': currentScrollableState["size.height"],
+          'viewPortCrossLengthDeflated': currentScrollableState["size.height"] -
+              crossAxisEndingEdgeDeflateOffset -
+              crossAxisStartingEdgeDeflateOffset,
+        };
+      }
+    }
+
+    Map<String, dynamic> secondaryMapper(Map<String, dynamic>? it) {
+      /// extra computation ..
+      int index = it!['index']!;
+
+      ///main
+      String mainPosition = '';
+      double subjectMainAxisStartViewPortEnd =
+      it['subjectMainAxisStartViewPortEnd']!;
+      double subjectMainAxisStartViewPortStart =
+      it['subjectMainAxisStartViewPortStart']!;
+      double subjectMainAxisEndViewPortStart =
+      it['subjectMainAxisEndViewPortStart']!;
+      double subjectMainAxisEndViewPortEnd =
+      it['subjectMainAxisEndViewPortEnd']!;
+      double viewPortMainLength = it['viewPortMainLength']!;
+
+      if (subjectMainAxisStartViewPortStart >= 0 &&
+          subjectMainAxisEndViewPortEnd >= 0) {
+        mainPosition = 'within-vp';
+      } else if (subjectMainAxisStartViewPortStart < 0 &&
+          subjectMainAxisEndViewPortEnd < 0) {
+        mainPosition = 'across-vp';
+      } else if (subjectMainAxisStartViewPortStart >= 0 &&
+          subjectMainAxisEndViewPortEnd < 0) {
+        mainPosition = subjectMainAxisStartViewPortEnd > 0
+            ? 'touched-vp-end'
+            : 'outside-vp-end';
+      } else if (subjectMainAxisStartViewPortStart < 0 &&
+          subjectMainAxisEndViewPortEnd >= 0) {
+        mainPosition = subjectMainAxisEndViewPortStart > 0
+            ? 'touched-vp-start'
+            : 'outside-vp-start';
+      } else {
+        throw Exception("Invalid mainPosition State.");
+      }
+
+      ///cross
+      String crossPosition = '';
+      double subjectCrossAxisStartViewPortEnd =
+      it['subjectCrossAxisStartViewPortEnd']!;
+      double subjectCrossAxisStartViewPortStart =
+      it['subjectCrossAxisStartViewPortStart']!;
+      double subjectCrossAxisEndViewPortStart =
+      it['subjectCrossAxisEndViewPortStart']!;
+      double subjectCrossAxisEndViewPortEnd =
+      it['subjectCrossAxisEndViewPortEnd']!;
+      double viewPortCrossLength = it['viewPortCrossLength']!;
+      if (subjectCrossAxisStartViewPortStart >= 0 &&
+          subjectCrossAxisEndViewPortEnd >= 0) {
+        crossPosition = 'within-vp';
+      } else if (subjectCrossAxisStartViewPortStart < 0 &&
+          subjectCrossAxisEndViewPortEnd < 0) {
+        crossPosition = 'across-vp';
+      } else if (subjectCrossAxisStartViewPortStart >= 0 &&
+          subjectCrossAxisEndViewPortEnd < 0) {
+        crossPosition = subjectCrossAxisStartViewPortEnd > 0
+            ? 'touched-vp-end'
+            : 'outside-vp-end';
+      } else if (subjectCrossAxisStartViewPortStart < 0 &&
+          subjectCrossAxisEndViewPortEnd >= 0) {
+        crossPosition = subjectCrossAxisEndViewPortStart > 0
+            ? 'touched-vp-start'
+            : 'outside-vp-start';
+      } else {
+        throw Exception("Invalid crossPosition State.");
+      }
+
+      bool viewPortDeflated = it['viewPortDeflated']! as bool;
+      String flow = it['flow'];
+
+      return {
+        'index': index,
+        'flow': flow,
+        'offScreen': mainPosition.contains('outside') ||
+            crossPosition.contains('outside'),
+        'topMostLayer': index == ancestorScrollableLayerStates.length - 1,
+        'viewPortDeflated': viewPortDeflated,
+
+        /// main
+        'mainPosition': mainPosition,
+        'subjectMainAxisStartViewPortEnd': subjectMainAxisStartViewPortEnd,
+        'subjectMainAxisStartViewPortStart': subjectMainAxisStartViewPortStart,
+        'subjectMainAxisEndViewPortStart': subjectMainAxisEndViewPortStart,
+        'subjectMainAxisEndViewPortEnd': subjectMainAxisEndViewPortEnd,
+        'viewPortMainLength': viewPortMainLength,
+
+        ///cross
+        'crossPosition': crossPosition,
+        'subjectCrossAxisStartViewPortEnd': subjectCrossAxisStartViewPortEnd,
+        'subjectCrossAxisStartViewPortStart':
+        subjectCrossAxisStartViewPortStart,
+        'subjectCrossAxisEndViewPortStart': subjectCrossAxisEndViewPortStart,
+        'subjectCrossAxisEndViewPortEnd': subjectCrossAxisEndViewPortEnd,
+        'viewPortCrossLength': viewPortCrossLength,
+      };
+    }
+
+    List<Map<String, dynamic>> visibilityStateLayers =
+    ancestorScrollableLayerStates
+        .map(primaryMapper)
+        .where((it) => it != null)
+        .map(secondaryMapper)
+        .toList();
+
+    if (visibilityStateLayers.isEmpty) return;
+
+    newStates[subjectKey] = {
+      'depth': ancestorScrollableLayerStates.length,
+      'head': visibilityStateLayers.isNotEmpty &&
+          visibilityStateLayers.length ==
+              ancestorScrollableLayerStates.length
+          ? visibilityStateLayers.last
+          : null,
+      'layers': visibilityStateLayers,
+      'summary': visibilityStateLayers
+          .map((it) =>
+      '${it['mainPosition'] as String}/${it['crossPosition'] as String}:${it['flow'] as String}')
+          .join("|")
+    };
+  }
+
+  scrollableListPerSubjectId.keys.forEach(processSubject);
+
+  return newStates;
 }
 
 class DebugOverlay extends StatelessWidget {
@@ -766,45 +943,45 @@ class DebugOverlay extends StatelessWidget {
     if (startingRatio + endingRatio == 0.0) return const SizedBox.shrink();
     return (axis == Axis.vertical)
         ? Column(
-            children: <Widget>[
-              Expanded(
-                flex: (startingRatio * 100).toInt(),
-                child: Container(
-                  color: offScreenColor,
-                ),
-              ),
-              Flexible(
-                flex: ((1 - startingRatio - endingRatio) * 100).toInt(),
-                child: Container(),
-              ),
-              Expanded(
-                flex: (endingRatio * 100).toInt(),
-                child: Container(
-                  color: offScreenColor,
-                ),
-              ),
-            ],
-          )
+      children: <Widget>[
+        Expanded(
+          flex: (startingRatio * 100).toInt(),
+          child: Container(
+            color: offScreenColor,
+          ),
+        ),
+        Flexible(
+          flex: ((1 - startingRatio - endingRatio) * 100).toInt(),
+          child: Container(),
+        ),
+        Expanded(
+          flex: (endingRatio * 100).toInt(),
+          child: Container(
+            color: offScreenColor,
+          ),
+        ),
+      ],
+    )
         : Row(
-            children: <Widget>[
-              Expanded(
-                flex: (startingRatio * 100).toInt(),
-                child: Container(
-                  color: offScreenColor,
-                ),
-              ),
-              Flexible(
-                flex: ((1 - startingRatio - endingRatio) * 100).toInt(),
-                child: Container(),
-              ),
-              Expanded(
-                flex: (endingRatio * 100).toInt(),
-                child: Container(
-                  color: offScreenColor,
-                ),
-              ),
-            ],
-          );
+      children: <Widget>[
+        Expanded(
+          flex: (startingRatio * 100).toInt(),
+          child: Container(
+            color: offScreenColor,
+          ),
+        ),
+        Flexible(
+          flex: ((1 - startingRatio - endingRatio) * 100).toInt(),
+          child: Container(),
+        ),
+        Expanded(
+          flex: (endingRatio * 100).toInt(),
+          child: Container(
+            color: offScreenColor,
+          ),
+        ),
+      ],
+    );
   }
 }
 
@@ -813,10 +990,11 @@ class VisibilityKey<T extends State<StatefulWidget>> extends GlobalKey<T> {
   final int id;
 }
 
-abstract class VisibilityChangeHandler {
+abstract mixin class VisibilityChangeHandler {
+  ScrollDirection currentScrollDirection = ScrollDirection
+      .reverse; //content goes up//scroll goes down//vertical-position increases
   Map<VisibilityKey, Map<String, dynamic>?> currentVisibilityStates = {};
   int previousVisibilityHash = 0;
-  int previousMetricHash = 0;
 
   VisibilityKey addNewVisibilityKeyToCollection(int id) {
     if (currentVisibilityStates.keys.any((it) => it.id == id)) {
@@ -841,20 +1019,20 @@ abstract class VisibilityChangeHandler {
 
   String mainPositionByKey(int id) {
     return currentVisibilityStates[getKeyById(id)]?["head"]?["mainPosition"]
-            as String? ??
+    as String? ??
         "";
   }
 
   String crossPositionByKey(int id) {
     return currentVisibilityStates[getKeyById(id)]?["head"]?["crossPosition"]
-            as String? ??
+    as String? ??
         "";
   }
 
   String mainPositionByKeyAt(int id, int index) {
     if (currentVisibilityStates[getKeyById(id)]?["layers"] == null) return '';
     var layers = currentVisibilityStates[getKeyById(id)]?["layers"]
-        as List<Map<String, dynamic>>;
+    as List<Map<String, dynamic>>;
     if (layers.length <= index) return '';
     var current = layers[index];
     return current["mainPosition"] as String? ?? "";
@@ -863,7 +1041,7 @@ abstract class VisibilityChangeHandler {
   String crossPositionByKeyAt(int id, int index) {
     if (currentVisibilityStates[getKeyById(id)]?["layers"] == null) return '';
     var layers = currentVisibilityStates[getKeyById(id)]?["layers"]
-        as List<Map<String, dynamic>>;
+    as List<Map<String, dynamic>>;
     if (layers.length <= index) return '';
     var current = layers[index];
     return current["crossPosition"] as String? ?? "";
@@ -889,39 +1067,42 @@ abstract class VisibilityChangeHandler {
 
   void scrollMetricsChanged();
 
-  bool didChangeVisibility(
-      Map<VisibilityKey, Map<String, dynamic>?> newStates) {
-    int currentVisibilityHash = newStates.keys
-        .map((key) {
-          return '${key.id}/${(newStates[key]?["summary"] ?? "")}';
-        })
-        .join('#')
-        .hashCode;
+  /// Update [currentScrollDirection]
+  ///
+  /// Apply new state
+  ///
+  /// Dispatch [scrollMetricsChanged] unconditionally
+  ///
+  /// Computes a new visibility hash for the current states and compares it to the previous hash.
+  ///
+  /// If the hash changes, dispatch [visibilityStatesChanged].
+  ///
+  /// @[newStates] --> newStates to be applied
+  ///
+  /// @[currentScrollDirection] --> forward|idle|reverse
+  bool applyAndNotify(Map<VisibilityKey, Map<String, dynamic>?> newStates,
+      ScrollDirection currentScrollDirection) {
+    this.currentScrollDirection = currentScrollDirection;
 
-    int currentMetricHash = newStates.keys
-        .map((key) {
-          if (newStates[key]?["head"] == null) return '_';
-          var head = (newStates[key]?["head"]) as Map<String, dynamic>?;
-          return json.encode(head);
-        })
-        .join('#')
-        .hashCode;
-
-    if (currentMetricHash == previousMetricHash) return false;
-    previousMetricHash = currentMetricHash;
-
-    //replace old states with new ones
+    //Replace old states with new ones
     currentVisibilityStates.forEach((key, value) {
       if (currentVisibilityStates.keys.contains(key)) {
         currentVisibilityStates[key] =
-            newStates.containsKey(key) ? newStates[key] : null;
+        newStates.containsKey(key) ? newStates[key] : null;
       }
     });
 
     // dispatch metric change notification firstly
     scrollMetricsChanged();
 
-    if (currentVisibilityHash == previousVisibilityHash) return true;
+    int currentVisibilityHash = newStates.keys
+        .map((key) {
+      return '${key.id}/${(newStates[key]?["summary"] ?? "")}';
+    })
+        .join('#')
+        .hashCode;
+
+    if (currentVisibilityHash == previousVisibilityHash) return false;
     previousVisibilityHash = currentVisibilityHash;
 
     // dispatch visibility state change notifications later on
@@ -955,6 +1136,7 @@ extension CheckWidgetVisibilityExtension on Widget {
       throw Exception(
           'watchVisibility can not accept widget without keys or key types other than VisibilityKey');
     }
+
     VisibilityKey visibilityKey = key as VisibilityKey;
 
     WidgetsBinding.instance.addPostFrameCallback((elapsedTime) {
@@ -1022,7 +1204,8 @@ List<Widget> createBars({
   const defaultCrossLength = 20.0;
   const defaultShiftOffset = 22.0;
   const animate = 300;
-  verticalStartFull(String orientation) => AnimatedPositionedDirectional(
+  verticalStartFull(String orientation) =>
+      AnimatedPositionedDirectional(
         top: 0.0 + verticalStartPadding,
         start: subjectHorizontalAxisStartViewPortStart + horizontalStartPadding,
         width: defaultCrossLength,
@@ -1040,7 +1223,8 @@ List<Widget> createBars({
           ),
         ),
       );
-  verticalStartHalf(String orientation) => AnimatedPositionedDirectional(
+  verticalStartHalf(String orientation) =>
+      AnimatedPositionedDirectional(
         top: 0.0 + verticalStartPadding,
         start: subjectHorizontalAxisStartViewPortStart +
             defaultShiftOffset +
@@ -1060,7 +1244,8 @@ List<Widget> createBars({
           ),
         ),
       );
-  verticalEndFull(String orientation) => AnimatedPositionedDirectional(
+  verticalEndFull(String orientation) =>
+      AnimatedPositionedDirectional(
         bottom: 0.0 + verticalEndPadding,
         end: subjectHorizontalAxisEndViewPortEnd + horizontalEndPadding,
         width: defaultCrossLength,
@@ -1078,7 +1263,8 @@ List<Widget> createBars({
           ),
         ),
       );
-  verticalEndHalf(String orientation) => AnimatedPositionedDirectional(
+  verticalEndHalf(String orientation) =>
+      AnimatedPositionedDirectional(
         bottom: 0.0 + verticalEndPadding,
         end: subjectHorizontalAxisEndViewPortEnd +
             defaultShiftOffset +
@@ -1097,7 +1283,8 @@ List<Widget> createBars({
         ),
       );
 
-  horizontalStartFull(String orientation) => AnimatedPositionedDirectional(
+  horizontalStartFull(String orientation) =>
+      AnimatedPositionedDirectional(
         start: 0.0 + horizontalStartPadding,
         top: subjectVerticalAxisStartViewPortStart + verticalStartPadding,
         height: defaultCrossLength,
@@ -1115,7 +1302,8 @@ List<Widget> createBars({
           ),
         ),
       );
-  horizontalStartHalf(String orientation) => AnimatedPositionedDirectional(
+  horizontalStartHalf(String orientation) =>
+      AnimatedPositionedDirectional(
         start: 0.0 + horizontalStartPadding,
         top: subjectVerticalAxisStartViewPortStart +
             defaultShiftOffset +
@@ -1135,7 +1323,8 @@ List<Widget> createBars({
           ),
         ),
       );
-  horizontalEndFull(String orientation) => AnimatedPositionedDirectional(
+  horizontalEndFull(String orientation) =>
+      AnimatedPositionedDirectional(
         end: 0.0 + horizontalEndPadding,
         bottom: subjectVerticalAxisEndViewPortEnd + verticalEndPadding,
         height: defaultCrossLength,
@@ -1153,7 +1342,8 @@ List<Widget> createBars({
           ),
         ),
       );
-  horizontalEndHalf(String orientation) => AnimatedPositionedDirectional(
+  horizontalEndHalf(String orientation) =>
+      AnimatedPositionedDirectional(
         end: 0.0 + horizontalEndPadding,
         bottom: subjectVerticalAxisEndViewPortEnd +
             defaultShiftOffset +
