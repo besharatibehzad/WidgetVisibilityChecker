@@ -31,7 +31,7 @@ The showcase covers various scenarios, including:
 ## Basic Scenario
 > Visibility monitoring in vertical and horizontal scroll views.
 
-[Static Demo (Video)](./docs/1.webm){:target="_blank"}
+[Static Demo (Video)](doc/1.webm){:target="_blank"}
 [Interactive Demo (Preview Only)](https://zxiy061gxiz0.zapp.page){:target="_blank"}
 [Interactive Demo (Preview and Edit)](https://zapp.run/edit/flutter-zxiy061gxiz0){:target="_blank"}
 [Getting Started](./lib/first_entry.dart){:target="_blank"}
@@ -50,7 +50,7 @@ This detailed visibility information empowers developers to make informed decisi
 ## Advanced Scenario
 > Detect and log metric changes for target widgets during scrolling.
 
-[Static Demo (Video)](./docs/2.webm){:target="_blank"}
+[Static Demo (Video)](doc/2.webm){:target="_blank"}
 [Interactive Demo (Preview Only)](https://zxiy061gxiz0.zapp.page){:target="_blank"}
 [Interactive Demo (Preview and Edit)](https://zapp.run/edit/flutter-zxiy061gxiz0){:target="_blank"}
 [Getting Started](./lib/first_entry.dart){:target="_blank"}
@@ -61,7 +61,7 @@ As users scroll through the interface, the system track and record various metri
 
 > Extends the functionality by introducing a `CustomScrollView` with support for multiple `SliverAppBar` widgets.
 
-[Static Demo (Video)](./docs/3.webm){:target="_blank"}
+[Static Demo (Video)](doc/3.webm){:target="_blank"}
 [Interactive Demo (Preview Only)](https://z91e06f291f0.zapp.page){:target="_blank"}
 [Interactive Demo (Preview and Edit)](https://zapp.run/edit/flutter-z91e06f291f0){:target="_blank"}
 [Getting Started](./lib/second_entry.dart){:target="_blank"}
