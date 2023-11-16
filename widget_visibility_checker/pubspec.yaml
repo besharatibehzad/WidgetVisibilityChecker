@@ -1,7 +1,7 @@
 name: widget_visibility_checker
-description: Check Widget Visibility in Multiple Nested Scrollable Containers
-version: 0.0.1
-homepage:
+description: Widget Visibility Tracking Across Nested Scrollable Containers.
+version: 1.0.0
+homepage: https://github.com/besharatibehzad/WidgetVisibilityChecker
 
 environment:
   sdk: '>=3.1.5 <4.0.0'
